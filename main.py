@@ -91,7 +91,7 @@ def cmd_predict(args):
     from pathlib import Path
     from PIL import Image
 
-    segmentor = PCBSegmentor(args.checkpoint, args.config)
+    segmentor = PCBSegmentor(args.checkpoint, args.config, enable_classification=not args.no_classification)
 
     if args.threshold is not None:
         segmentor.threshold = args.threshold
@@ -107,6 +107,7 @@ def cmd_predict(args):
             output_dir=str(output_dir),
             save_mask=not args.no_mask,
             save_overlay=not args.no_overlay,
+            save_report=not args.no_classification and not args.no_report,
         )
     else:
         result = segmentor.predict(str(input_path))
@@ -115,6 +116,19 @@ def cmd_predict(args):
         print(f"  分类分数: {result['class_score']:.4f}")
         print(f"  缺陷面积: {result['defect_area']} 像素")
         print(f"  缺陷占比: {result['defect_ratio']:.2%}")
+
+        # 打印分类统计
+        if result.get("classification_report"):
+            cr = result["classification_report"]
+            print(f"\n  缺陷分类统计:")
+            type_names = {
+                "short_circuit": "    短路 (Short Circuit)",
+                "micro_crack": "    微裂纹 (Micro Crack)",
+                "unknown": "    未知类型 (Unknown)",
+            }
+            for dt, ds in cr.get("defect_types", {}).items():
+                name = type_names.get(dt, f"    {dt}")
+                print(f"{name}: {ds['count']} 个, 总面积 {ds['total_area']} 像素")
 
         output_dir.mkdir(parents=True, exist_ok=True)
         mask_path = output_dir / f"{input_path.stem}_mask.png"
@@ -182,6 +196,10 @@ def main():
     pred_parser.add_argument("--min_area", type=int, default=None)
     pred_parser.add_argument("--no_mask", action="store_true")
     pred_parser.add_argument("--no_overlay", action="store_true")
+    pred_parser.add_argument("--no_classification", action="store_true",
+                             help="禁用缺陷自动分类统计子模块")
+    pred_parser.add_argument("--no_report", action="store_true",
+                             help="不保存结构化统计报表")
 
     # API 服务
     serve_parser = subparsers.add_parser("serve", help="启动 API 服务")

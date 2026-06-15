@@ -12,6 +12,7 @@ from utils import load_config, get_device
 from utils import mirror_pad_resize, unpad_image, unpad_points
 from models import build_model
 from data import build_inference_dataset
+from evaluation import DefectClassifier, DefectReportGenerator
 
 
 class PCBSegmentor:
@@ -22,6 +23,8 @@ class PCBSegmentor:
     - 缺陷二值掩码
     - 缺陷像素总面积
     - 短路/缺陷坐标点位
+    - 缺陷自动分类（短路/微裂纹）
+    - 结构化分类统计报表
 
     边缘镜像填充特性：
     - 高倍显微大图缩放前先进行边缘镜像填充
@@ -29,13 +32,15 @@ class PCBSegmentor:
     - 推理后自动裁剪回原始图像尺寸，坐标自动映射
     """
 
-    def __init__(self, checkpoint_path, config=None, device=None, use_mirror_pad=None):
+    def __init__(self, checkpoint_path, config=None, device=None, use_mirror_pad=None,
+                 enable_classification=True):
         """
         Args:
             checkpoint_path: 模型检查点路径
             config: 配置字典或配置文件路径
             device: 计算设备（自动检测）
             use_mirror_pad: 是否使用边缘镜像填充（默认从配置读取，开启）
+            enable_classification: 是否启用缺陷分类统计（默认开启）
         """
         # 加载检查点
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -76,6 +81,16 @@ class PCBSegmentor:
         # 图像标准化参数（ImageNet 均值标准差）
         self._normalize_mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         self._normalize_std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+        # 缺陷分类器配置
+        self.enable_classification = enable_classification
+        if enable_classification:
+            class_config = self.config.get("classification", {})
+            self.defect_classifier = DefectClassifier(class_config)
+            self.report_generator = DefectReportGenerator()
+        else:
+            self.defect_classifier = None
+            self.report_generator = None
 
     def _preprocess_image(self, image_path):
         """
@@ -136,6 +151,54 @@ class PCBSegmentor:
 
         return mask_orig
 
+    def _parse_mask(self, binary_mask):
+        """
+        解析二值掩码：连通区域分析，提取缺陷信息（可复用）
+
+        Args:
+            binary_mask: 二值掩码 [H, W]
+
+        Returns:
+            tuple: (filtered_mask, defect_points, total_defect_area)
+        """
+        # 连通区域分析
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            binary_mask, connectivity=8
+        )
+
+        # 过滤小区域
+        filtered_mask = np.zeros_like(binary_mask)
+        defect_points = []
+        total_defect_area = 0
+
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area >= self.min_defect_area:
+                filtered_mask[labels == i] = 255
+                total_defect_area += area
+
+                # 收集缺陷区域内的代表性点
+                cx, cy = int(centroids[i][0]), int(centroids[i][1])
+                defect_points.append({"x": cx, "y": cy, "area": int(area)})
+
+                # 轮廓点
+                contours, _ = cv2.findContours(
+                    (labels == i).astype(np.uint8),
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE
+                )
+                if contours:
+                    contour = contours[0].reshape(-1, 2)
+                    step = max(1, len(contour) // 10)
+                    for pt in contour[::step]:
+                        defect_points.append({
+                            "x": int(pt[0]),
+                            "y": int(pt[1]),
+                            "type": "contour"
+                        })
+
+        return filtered_mask, defect_points, total_defect_area, labels, stats, centroids, num_labels
+
     @torch.no_grad()
     def predict(self, image_path):
         """
@@ -150,10 +213,12 @@ class PCBSegmentor:
                 - mask_prob: 概率掩码 numpy array [H, W]
                 - defect_area: 缺陷像素面积
                 - defect_ratio: 缺陷占比
-                - defect_points: 缺陷坐标点列表 [(x, y), ...]
+                - defect_points: 缺陷坐标点列表
                 - has_defect: 是否有缺陷
                 - class_score: 图像级分类分数
                 - pad_info: 填充信息（镜像填充模式）
+                - classification_report: 缺陷分类统计报表
+                - defect_details: 各缺陷详细信息（分类、面积、位置等）
         """
         # 预处理
         img_tensor, pad_info, orig_size = self._preprocess_image(image_path)
@@ -170,50 +235,15 @@ class PCBSegmentor:
         # 二值化
         binary_mask = (mask_prob > self.threshold).astype(np.uint8) * 255
 
-        # 连通区域分析，过滤小面积缺陷
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            binary_mask, connectivity=8
-        )
-
-        # 过滤小区域
-        filtered_mask = np.zeros_like(binary_mask)
-        defect_points = []
-        total_defect_area = 0
-
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            if area >= self.min_defect_area:
-                filtered_mask[labels == i] = 255
-                total_defect_area += area
-
-                # 收集缺陷区域内的代表性点（中心点 + 轮廓点）
-                cx, cy = int(centroids[i][0]), int(centroids[i][1])
-                defect_points.append({"x": cx, "y": cy, "area": int(area)})
-
-                # 轮廓点
-                contours, _ = cv2.findContours(
-                    (labels == i).astype(np.uint8),
-                    cv2.RETR_EXTERNAL,
-                    cv2.CHAIN_APPROX_SIMPLE
-                )
-                if contours:
-                    # 每隔几个点取一个轮廓点
-                    contour = contours[0].reshape(-1, 2)
-                    step = max(1, len(contour) // 10)
-                    for pt in contour[::step]:
-                        defect_points.append({
-                            "x": int(pt[0]),
-                            "y": int(pt[1]),
-                            "type": "contour"
-                        })
+        # 解析掩码（复用逻辑）
+        filtered_mask, defect_points, total_defect_area, labels, stats, centroids, num_labels = self._parse_mask(binary_mask)
 
         # 计算缺陷占比
         h, w = mask_prob.shape
         defect_ratio = total_defect_area / (h * w) if h * w > 0 else 0
-
         has_defect = total_defect_area > 0 and class_score > self.threshold
 
-        return {
+        result = {
             "mask": filtered_mask,
             "mask_prob": mask_prob,
             "defect_area": int(total_defect_area),
@@ -226,6 +256,35 @@ class PCBSegmentor:
             "pad_info": pad_info,
             "use_mirror_pad": self.use_mirror_pad,
         }
+
+        # 缺陷分类统计
+        if self.enable_classification and self.defect_classifier is not None:
+            defects, statistics = self.defect_classifier.classify_mask(
+                filtered_mask, min_area=self.min_defect_area
+            )
+            classification_report = self.report_generator.generate_single_report(
+                image_path,
+                result["image_size"],
+                class_score,
+                has_defect,
+                statistics,
+                defects
+            )
+            result["classification_report"] = classification_report
+            result["defect_details"] = [
+                {
+                    "type": d.classification,
+                    "confidence": float(d.confidence),
+                    "area": int(d.area),
+                    "centroid": {"x": d.centroid[0], "y": d.centroid[1]},
+                    "bbox": {"x": d.bbox[0], "y": d.bbox[1], "w": d.bbox[2], "h": d.bbox[3]},
+                    "aspect_ratio": float(d.aspect_ratio),
+                    "perimeter": float(d.perimeter),
+                }
+                for d in defects
+            ]
+
+        return result
 
     def _preprocess_batch(self, image_paths):
         """
@@ -261,7 +320,7 @@ class PCBSegmentor:
             image_paths: 图片路径列表
 
         Returns:
-            list: 每张图片的推理结果列表
+            list: 每张图片的推理结果列表（包含 classification_report 和 defect_details）
         """
         # 批量预处理
         batch_tensor, pad_infos, orig_sizes = self._preprocess_batch(image_paths)
@@ -286,30 +345,15 @@ class PCBSegmentor:
             # 二值化
             binary_mask = (mask_prob > self.threshold).astype(np.uint8) * 255
 
-            # 连通区域分析
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-                binary_mask, connectivity=8
-            )
-
-            filtered_mask = np.zeros_like(binary_mask)
-            defect_points = []
-            total_defect_area = 0
-
-            for j in range(1, num_labels):
-                area = stats[j, cv2.CC_STAT_AREA]
-                if area >= self.min_defect_area:
-                    filtered_mask[labels == j] = 255
-                    total_defect_area += area
-
-                    cx, cy = int(centroids[j][0]), int(centroids[j][1])
-                    defect_points.append({"x": cx, "y": cy, "area": int(area)})
+            # 解析掩码（复用逻辑）
+            filtered_mask, defect_points, total_defect_area, labels, stats, centroids, num_labels = self._parse_mask(binary_mask)
 
             h, w = mask_prob.shape
             defect_ratio = total_defect_area / (h * w) if h * w > 0 else 0
             class_score = class_scores[i, 0].item()
             has_defect = total_defect_area > 0 and class_score > self.threshold
 
-            results.append({
+            result = {
                 "mask": filtered_mask,
                 "mask_prob": mask_prob,
                 "defect_area": int(total_defect_area),
@@ -321,12 +365,41 @@ class PCBSegmentor:
                 "image_size": {"width": w, "height": h},
                 "pad_info": pad_info,
                 "use_mirror_pad": self.use_mirror_pad,
-            })
+            }
+
+            # 缺陷分类统计
+            if self.enable_classification and self.defect_classifier is not None:
+                defects, statistics = self.defect_classifier.classify_mask(
+                    filtered_mask, min_area=self.min_defect_area
+                )
+                classification_report = self.report_generator.generate_single_report(
+                    image_paths[i],
+                    result["image_size"],
+                    class_score,
+                    has_defect,
+                    statistics,
+                    defects
+                )
+                result["classification_report"] = classification_report
+                result["defect_details"] = [
+                    {
+                        "type": d.classification,
+                        "confidence": float(d.confidence),
+                        "area": int(d.area),
+                        "centroid": {"x": d.centroid[0], "y": d.centroid[1]},
+                        "bbox": {"x": d.bbox[0], "y": d.bbox[1], "w": d.bbox[2], "h": d.bbox[3]},
+                        "aspect_ratio": float(d.aspect_ratio),
+                        "perimeter": float(d.perimeter),
+                    }
+                    for d in defects
+                ]
+
+            results.append(result)
 
         return results
 
     def predict_folder(self, folder_path, output_dir=None, save_mask=True,
-                       save_overlay=True):
+                       save_overlay=True, save_report=True):
         """
         对文件夹中的所有图片进行批量推理
 
@@ -335,9 +408,10 @@ class PCBSegmentor:
             output_dir: 输出目录
             save_mask: 是否保存掩码
             save_overlay: 是否保存叠加图
+            save_report: 是否保存结构化分类统计报表
 
         Returns:
-            dict: 统计结果
+            dict: 统计结果，包含 batch_report（批量分类汇总报表）
         """
         folder_path = Path(folder_path)
         image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -367,6 +441,11 @@ class PCBSegmentor:
             "avg_defect_area": float(avg_defect_area),
         }
 
+        # 生成批量分类统计报表
+        batch_report = None
+        if self.enable_classification and self.report_generator is not None:
+            batch_report = self.report_generator.generate_batch_report(results)
+
         # 保存结果
         if output_dir is not None:
             output_dir = Path(output_dir)
@@ -389,14 +468,34 @@ class PCBSegmentor:
                     overlay_path = output_dir / f"{base_name}_overlay.png"
                     overlay.save(overlay_path)
 
+                # 保存单图分类报表
+                if save_report and result.get("classification_report"):
+                    report_path = output_dir / f"{base_name}_report.json"
+                    import json
+                    with open(report_path, "w", encoding="utf-8") as f:
+                        json.dump(result["classification_report"], f, indent=2, ensure_ascii=False)
+
             # 保存统计结果
             import json
             stats_path = output_dir / "statistics.json"
             with open(stats_path, "w", encoding="utf-8") as f:
                 json.dump(stats, f, indent=2, ensure_ascii=False)
 
+            # 保存批量分类汇总报表
+            if save_report and batch_report is not None:
+                report_path = output_dir / "batch_defect_report.json"
+                with open(report_path, "w", encoding="utf-8") as f:
+                    json.dump(batch_report, f, indent=2, ensure_ascii=False)
+
+                # 保存可读文本报表
+                text_report = self.report_generator.format_report_text(batch_report)
+                text_report_path = output_dir / "batch_defect_report.txt"
+                with open(text_report_path, "w", encoding="utf-8") as f:
+                    f.write(text_report)
+
             print(f"结果已保存到: {output_dir}")
 
+        # 打印
         print(f"\n推理完成：")
         print(f"  总图片数: {total}")
         print(f"  缺陷图片: {defect_count}")
@@ -404,9 +503,25 @@ class PCBSegmentor:
         print(f"  缺陷率: {stats['defect_ratio']:.2%}")
         print(f"  平均缺陷面积: {avg_defect_area:.1f} 像素")
 
+        # 打印分类统计
+        if batch_report is not None:
+            print("\n--- 缺陷分类统计 ---")
+            type_names = {
+                "short_circuit": "短路 (Short Circuit)",
+                "micro_crack": "微裂纹 (Micro Crack)",
+                "unknown": "未知类型 (Unknown)",
+            }
+            for dt, ds in batch_report["by_type_summary"].items():
+                name = type_names.get(dt, dt)
+                print(f"  {name}:")
+                print(f"    缺陷总数:   {ds['count']}")
+                print(f"    出现图片数: {ds['image_count']}")
+                print(f"    总面积:     {ds['total_area']} 像素")
+
         return {
             "results": results,
             "statistics": stats,
+            "batch_report": batch_report,
         }
 
     def _create_overlay(self, original_img, mask, color=(255, 0, 0), alpha=0.5):

@@ -81,6 +81,26 @@ inference:
   output_dir: "outputs/inference"
   save_mask: true
   save_overlay: true
+  # 是否启用缺陷分类统计子模块
+  enable_classification: true
+
+# 缺陷分类统计配置
+classification:
+  # 最小缺陷面积（像素），小于此面积的缺陷被视为噪声忽略
+  min_area: 20
+  # 短路特征阈值
+  short_circuit:
+    min_area: 500
+    min_aspect_ratio: 3.0
+    min_rectangularity: 0.6
+  # 微裂纹特征阈值
+  micro_crack:
+    max_area: 800
+    min_solidity: 0.7
+    min_eccentricity: 0.85
+    min_skeleton_area_ratio: 0.15
+  # 分类打分阈值，高于此分数判定为该类型
+  score_threshold: 0.5
 
 # 评估配置
 evaluation:

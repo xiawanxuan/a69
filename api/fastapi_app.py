@@ -26,6 +26,25 @@ app = FastAPI(
 segmentor: Optional[PCBSegmentor] = None
 
 
+class DefectDetail(BaseModel):
+    """单个缺陷详情"""
+    type: str = Field(..., description="缺陷类型: short_circuit/micro_crack/unknown")
+    confidence: float = Field(..., description="分类置信度")
+    area: int = Field(..., description="缺陷像素面积")
+    centroid: dict = Field(default_factory=dict, description="缺陷中心坐标")
+    bbox: dict = Field(default_factory=dict, description="缺陷外接矩形")
+    aspect_ratio: float = Field(default=0.0, description="长宽比")
+    perimeter: float = Field(default=0.0, description="周长")
+
+
+class ClassificationReport(BaseModel):
+    """缺陷分类统计报表"""
+    image: dict = Field(default_factory=dict, description="图像信息")
+    classification: dict = Field(default_factory=dict, description="图像级分类结果")
+    summary: dict = Field(default_factory=dict, description="缺陷汇总统计")
+    defect_types: dict = Field(default_factory=dict, description="按类型分类统计")
+
+
 class InferenceResult(BaseModel):
     """推理结果模型"""
     has_defect: bool = Field(..., description="是否检测到缺陷")
@@ -34,12 +53,15 @@ class InferenceResult(BaseModel):
     defect_ratio: float = Field(..., description="缺陷面积占比")
     defect_points: list = Field(default_factory=list, description="缺陷坐标点列表")
     image_size: dict = Field(default_factory=dict, description="图像尺寸")
+    classification_report: Optional[ClassificationReport] = Field(None, description="缺陷分类统计报表")
+    defect_details: Optional[List[DefectDetail]] = Field(None, description="各缺陷详细信息")
 
 
 class BatchInferenceResponse(BaseModel):
     """批量推理响应"""
     results: List[InferenceResult]
     statistics: dict
+    batch_report: Optional[dict] = Field(None, description="批量分类汇总报表")
 
 
 class HealthResponse(BaseModel):
@@ -139,6 +161,31 @@ async def predict(
         # 清理临时文件
         temp_path.unlink(missing_ok=True)
 
+        # 构造分类统计结果
+        classification_report = None
+        defect_details = None
+        if result.get("classification_report"):
+            cr = result["classification_report"]
+            classification_report = ClassificationReport(
+                image=cr.get("image", {}),
+                classification=cr.get("classification", {}),
+                summary=cr.get("summary", {}),
+                defect_types=cr.get("defect_types", {}),
+            )
+        if result.get("defect_details"):
+            defect_details = [
+                DefectDetail(
+                    type=d.get("type", "unknown"),
+                    confidence=d.get("confidence", 0.0),
+                    area=d.get("area", 0),
+                    centroid=d.get("centroid", {}),
+                    bbox=d.get("bbox", {}),
+                    aspect_ratio=d.get("aspect_ratio", 0.0),
+                    perimeter=d.get("perimeter", 0.0),
+                )
+                for d in result["defect_details"]
+            ]
+
         # 返回结果（去掉 numpy 数组）
         return InferenceResult(
             has_defect=result["has_defect"],
@@ -147,6 +194,8 @@ async def predict(
             defect_ratio=result["defect_ratio"],
             defect_points=result["defect_points"],
             image_size=result["image_size"],
+            classification_report=classification_report,
+            defect_details=defect_details,
         )
 
     except Exception as e:
@@ -236,22 +285,52 @@ async def predict_batch(
             "defect_ratio": defect_count / total if total > 0 else 0,
         }
 
+        # 生成批量分类汇总报表
+        batch_report = None
+        if segmentor.enable_classification and segmentor.report_generator is not None:
+            batch_report = segmentor.report_generator.generate_batch_report(results)
+
         # 构造响应
-        result_models = [
-            InferenceResult(
+        result_models = []
+        for r in results:
+            classification_report = None
+            defect_details = None
+            if r.get("classification_report"):
+                cr = r["classification_report"]
+                classification_report = ClassificationReport(
+                    image=cr.get("image", {}),
+                    classification=cr.get("classification", {}),
+                    summary=cr.get("summary", {}),
+                    defect_types=cr.get("defect_types", {}),
+                )
+            if r.get("defect_details"):
+                defect_details = [
+                    DefectDetail(
+                        type=d.get("type", "unknown"),
+                        confidence=d.get("confidence", 0.0),
+                        area=d.get("area", 0),
+                        centroid=d.get("centroid", {}),
+                        bbox=d.get("bbox", {}),
+                        aspect_ratio=d.get("aspect_ratio", 0.0),
+                        perimeter=d.get("perimeter", 0.0),
+                    )
+                    for d in r["defect_details"]
+                ]
+            result_models.append(InferenceResult(
                 has_defect=r["has_defect"],
                 class_score=r["class_score"],
                 defect_area=r["defect_area"],
                 defect_ratio=r["defect_ratio"],
                 defect_points=r["defect_points"],
                 image_size=r["image_size"],
-            )
-            for r in results
-        ]
+                classification_report=classification_report,
+                defect_details=defect_details,
+            ))
 
         return BatchInferenceResponse(
             results=result_models,
             statistics=statistics,
+            batch_report=batch_report,
         )
 
     except Exception as e:
@@ -290,7 +369,8 @@ async def predict_base64(
         mask_img.save(buf, format="PNG")
         mask_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        return {
+        # 构造返回（包含分类统计结果）
+        response = {
             "has_defect": result["has_defect"],
             "class_score": result["class_score"],
             "defect_area": result["defect_area"],
@@ -299,6 +379,12 @@ async def predict_base64(
             "image_size": result["image_size"],
             "mask_base64": mask_base64,
         }
+        if result.get("classification_report"):
+            response["classification_report"] = result["classification_report"]
+        if result.get("defect_details"):
+            response["defect_details"] = result["defect_details"]
+
+        return response
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"推理失败: {str(e)}")
