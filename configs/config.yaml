@@ -14,6 +14,9 @@ data:
   test_ratio: 0.1
   num_workers: 4
   pin_memory: true
+  # 边缘镜像填充：高倍显微大图缩放前先镜像填充边缘
+  # 避免边缘短路/微裂纹缺陷因直接缩放而截断丢失
+  use_mirror_pad: true
 
 # 模型配置
 model:

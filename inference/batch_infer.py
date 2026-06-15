@@ -9,6 +9,7 @@ from PIL import Image
 import cv2
 
 from utils import load_config, get_device
+from utils import mirror_pad_resize, unpad_image, unpad_points
 from models import build_model
 from data import build_inference_dataset
 
@@ -21,14 +22,20 @@ class PCBSegmentor:
     - 缺陷二值掩码
     - 缺陷像素总面积
     - 短路/缺陷坐标点位
+
+    边缘镜像填充特性：
+    - 高倍显微大图缩放前先进行边缘镜像填充
+    - 避免边缘短路/微裂纹缺陷因直接缩放而截断丢失
+    - 推理后自动裁剪回原始图像尺寸，坐标自动映射
     """
 
-    def __init__(self, checkpoint_path, config=None, device=None):
+    def __init__(self, checkpoint_path, config=None, device=None, use_mirror_pad=None):
         """
         Args:
             checkpoint_path: 模型检查点路径
             config: 配置字典或配置文件路径
             device: 计算设备（自动检测）
+            use_mirror_pad: 是否使用边缘镜像填充（默认从配置读取，开启）
         """
         # 加载检查点
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -59,6 +66,76 @@ class PCBSegmentor:
         self.min_defect_area = infer_cfg.get("min_defect_area", 50)
         self.image_size = tuple(self.config.get("data", {}).get("image_size", [256, 256]))
 
+        # 边缘镜像填充配置
+        data_cfg = self.config.get("data", {})
+        if use_mirror_pad is None:
+            self.use_mirror_pad = data_cfg.get("use_mirror_pad", True)
+        else:
+            self.use_mirror_pad = use_mirror_pad
+
+        # 图像标准化参数（ImageNet 均值标准差）
+        self._normalize_mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        self._normalize_std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    def _preprocess_image(self, image_path):
+        """
+        图像预处理：镜像填充 + 转Tensor + 标准化
+
+        Args:
+            image_path: 图片路径
+
+        Returns:
+            tuple: (image_tensor, pad_info, orig_size)
+        """
+        orig_img = Image.open(image_path).convert("RGB")
+        orig_array = np.array(orig_img)
+        orig_size = orig_img.size  # (width, height)
+
+        if self.use_mirror_pad:
+            # 边缘镜像填充 + 等比例缩放
+            padded, pad_info = mirror_pad_resize(
+                orig_array, self.image_size, return_pad_info=True
+            )
+        else:
+            # 直接缩放
+            padded = cv2.resize(
+                orig_array,
+                (self.image_size[1], self.image_size[0]),
+                interpolation=cv2.INTER_LINEAR
+            )
+            pad_info = None
+
+        # 转 Tensor 并标准化
+        img_tensor = torch.from_numpy(padded).float() / 255.0
+        img_tensor = img_tensor.permute(2, 0, 1)  # HWC -> CHW
+        img_tensor = (img_tensor - self._normalize_mean) / self._normalize_std
+        img_tensor = img_tensor.unsqueeze(0)  # 增加 batch 维度
+
+        return img_tensor, pad_info, orig_size
+
+    def _postprocess_mask(self, mask_prob, pad_info, orig_size):
+        """
+        掩码后处理：去除填充区域 + 缩放回原始尺寸
+
+        Args:
+            mask_prob: 模型输出的概率掩码 [H, W] (numpy)
+            pad_info: 填充信息字典
+            orig_size: 原始尺寸 (width, height)
+
+        Returns:
+            numpy array: 原始尺寸的概率掩码 [H, W]
+        """
+        if self.use_mirror_pad and pad_info is not None:
+            # 先裁剪掉填充区域，再缩放回原始尺寸
+            mask_orig = unpad_image(mask_prob, pad_info, return_orig_size=True)
+        else:
+            # 直接缩放回原始尺寸
+            mask_orig = cv2.resize(
+                mask_prob, orig_size, interpolation=cv2.INTER_LINEAR
+            )
+
+        return mask_orig
+
     @torch.no_grad()
     def predict(self, image_path):
         """
@@ -76,30 +153,19 @@ class PCBSegmentor:
                 - defect_points: 缺陷坐标点列表 [(x, y), ...]
                 - has_defect: 是否有缺陷
                 - class_score: 图像级分类分数
+                - pad_info: 填充信息（镜像填充模式）
         """
-        # 加载原始图像
-        orig_img = Image.open(image_path).convert("RGB")
-        orig_size = orig_img.size  # (width, height)
-
-        # 构建数据加载器（单张）
-        dataloader = build_inference_dataset(
-            [image_path], self.config, self.image_size
-        )
+        # 预处理
+        img_tensor, pad_info, orig_size = self._preprocess_image(image_path)
+        img_tensor = img_tensor.to(self.device)
 
         # 推理
-        for batch in dataloader:
-            images = batch["image"].to(self.device)
-            outputs = self.model(images)
+        outputs = self.model(img_tensor)
+        mask_prob = torch.sigmoid(outputs["mask"])[0, 0].cpu().numpy()
+        class_score = torch.sigmoid(outputs["class_logit"])[0, 0].item()
 
-            # 获取概率掩码
-            mask_prob = torch.sigmoid(outputs["mask"])
-            mask_prob = mask_prob[0, 0].cpu().numpy()
-
-            # 分类分数
-            class_score = torch.sigmoid(outputs["class_logit"])[0, 0].item()
-
-        # 调整回原始尺寸
-        mask_prob = cv2.resize(mask_prob, orig_size, interpolation=cv2.INTER_LINEAR)
+        # 后处理：裁剪填充区域 + 缩放回原图
+        mask_prob = self._postprocess_mask(mask_prob, pad_info, orig_size)
 
         # 二值化
         binary_mask = (mask_prob > self.threshold).astype(np.uint8) * 255
@@ -157,7 +223,34 @@ class PCBSegmentor:
             "class_score": float(class_score),
             "image_path": str(image_path),
             "image_size": {"width": w, "height": h},
+            "pad_info": pad_info,
+            "use_mirror_pad": self.use_mirror_pad,
         }
+
+    def _preprocess_batch(self, image_paths):
+        """
+        批量图像预处理
+
+        Args:
+            image_paths: 图片路径列表
+
+        Returns:
+            tuple: (batch_tensor, pad_infos, orig_sizes)
+        """
+        batch_tensors = []
+        pad_infos = []
+        orig_sizes = []
+
+        for img_path in image_paths:
+            img_tensor, pad_info, orig_size = self._preprocess_image(img_path)
+            batch_tensors.append(img_tensor.squeeze(0))  # 去掉 batch 维
+            pad_infos.append(pad_info)
+            orig_sizes.append(orig_size)
+
+        # 拼接成 batch
+        batch_tensor = torch.stack(batch_tensors, dim=0)
+
+        return batch_tensor, pad_infos, orig_sizes
 
     @torch.no_grad()
     def predict_batch(self, image_paths):
@@ -170,71 +263,65 @@ class PCBSegmentor:
         Returns:
             list: 每张图片的推理结果列表
         """
-        dataloader = build_inference_dataset(
-            image_paths, self.config, self.image_size
-        )
+        # 批量预处理
+        batch_tensor, pad_infos, orig_sizes = self._preprocess_batch(image_paths)
+        batch_tensor = batch_tensor.to(self.device)
+        batch_size = batch_tensor.size(0)
+
+        # 推理
+        outputs = self.model(batch_tensor)
+        mask_probs = torch.sigmoid(outputs["mask"])
+        class_scores = torch.sigmoid(outputs["class_logit"])
 
         results = []
-        idx = 0
 
-        for batch in dataloader:
-            images = batch["image"].to(self.device)
-            batch_size = images.size(0)
+        for i in range(batch_size):
+            mask_prob = mask_probs[i, 0].cpu().numpy()
+            pad_info = pad_infos[i]
+            orig_size = orig_sizes[i]
 
-            outputs = self.model(images)
-            mask_probs = torch.sigmoid(outputs["mask"])
-            class_scores = torch.sigmoid(outputs["class_logit"])
+            # 后处理：裁剪填充区域 + 缩放回原图
+            mask_prob = self._postprocess_mask(mask_prob, pad_info, orig_size)
 
-            for i in range(batch_size):
-                if idx >= len(image_paths):
-                    break
+            # 二值化
+            binary_mask = (mask_prob > self.threshold).astype(np.uint8) * 255
 
-                # 加载原始图像获取尺寸
-                orig_img = Image.open(image_paths[idx]).convert("RGB")
-                orig_size = orig_img.size  # (width, height)
+            # 连通区域分析
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                binary_mask, connectivity=8
+            )
 
-                mask_prob = mask_probs[i, 0].cpu().numpy()
-                mask_prob = cv2.resize(mask_prob, orig_size, interpolation=cv2.INTER_LINEAR)
+            filtered_mask = np.zeros_like(binary_mask)
+            defect_points = []
+            total_defect_area = 0
 
-                # 二值化
-                binary_mask = (mask_prob > self.threshold).astype(np.uint8) * 255
+            for j in range(1, num_labels):
+                area = stats[j, cv2.CC_STAT_AREA]
+                if area >= self.min_defect_area:
+                    filtered_mask[labels == j] = 255
+                    total_defect_area += area
 
-                # 连通区域分析
-                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-                    binary_mask, connectivity=8
-                )
+                    cx, cy = int(centroids[j][0]), int(centroids[j][1])
+                    defect_points.append({"x": cx, "y": cy, "area": int(area)})
 
-                filtered_mask = np.zeros_like(binary_mask)
-                defect_points = []
-                total_defect_area = 0
+            h, w = mask_prob.shape
+            defect_ratio = total_defect_area / (h * w) if h * w > 0 else 0
+            class_score = class_scores[i, 0].item()
+            has_defect = total_defect_area > 0 and class_score > self.threshold
 
-                for j in range(1, num_labels):
-                    area = stats[j, cv2.CC_STAT_AREA]
-                    if area >= self.min_defect_area:
-                        filtered_mask[labels == j] = 255
-                        total_defect_area += area
-
-                        cx, cy = int(centroids[j][0]), int(centroids[j][1])
-                        defect_points.append({"x": cx, "y": cy, "area": int(area)})
-
-                h, w = mask_prob.shape
-                defect_ratio = total_defect_area / (h * w) if h * w > 0 else 0
-                class_score = class_scores[i, 0].item()
-                has_defect = total_defect_area > 0 and class_score > self.threshold
-
-                results.append({
-                    "mask": filtered_mask,
-                    "mask_prob": mask_prob,
-                    "defect_area": int(total_defect_area),
-                    "defect_ratio": float(defect_ratio),
-                    "defect_points": defect_points,
-                    "has_defect": bool(has_defect),
-                    "class_score": float(class_score),
-                    "image_path": str(image_paths[idx]),
-                    "image_size": {"width": w, "height": h},
-                })
-
-                idx += 1
+            results.append({
+                "mask": filtered_mask,
+                "mask_prob": mask_prob,
+                "defect_area": int(total_defect_area),
+                "defect_ratio": float(defect_ratio),
+                "defect_points": defect_points,
+                "has_defect": bool(has_defect),
+                "class_score": float(class_score),
+                "image_path": str(image_paths[i]),
+                "image_size": {"width": w, "height": h},
+                "pad_info": pad_info,
+                "use_mirror_pad": self.use_mirror_pad,
+            })
 
         return results
 

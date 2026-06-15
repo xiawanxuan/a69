@@ -20,14 +20,16 @@ class PCBWeakDataset(Dataset):
         transform: 图像变换
         image_size: 图像尺寸 [height, width]
         return_pixel_label: 是否返回像素级标签
+        use_mirror_pad: 是否使用边缘镜像填充（替代直接 Resize）
     """
 
     def __init__(self, samples, transform=None, image_size=(256, 256),
-                 return_pixel_label=False):
+                 return_pixel_label=False, use_mirror_pad=False):
         self.samples = samples
         self.transform = transform
         self.image_size = image_size
         self.return_pixel_label = return_pixel_label
+        self.use_mirror_pad = use_mirror_pad
 
     def __len__(self):
         return len(self.samples)
@@ -44,6 +46,7 @@ class PCBWeakDataset(Dataset):
             pixel_mask = Image.open(sample["label"]).convert("L")
 
         # 应用变换
+        pad_info = None
         if self.transform is not None:
             # 如果有像素掩码，需要同步变换
             if pixel_mask is not None:
@@ -52,9 +55,21 @@ class PCBWeakDataset(Dataset):
                 torch.manual_seed(seed)
                 image = self.transform(image)
                 torch.manual_seed(seed)
-                pixel_mask = self.transform_mask(pixel_mask)
+                pixel_mask, pad_info = self.transform_mask(pixel_mask, return_pad_info=True)
             else:
-                image = self.transform(image)
+                if self.use_mirror_pad and hasattr(self.transform, 'transforms'):
+                    from utils.image_utils import mirror_pad_resize
+                    # 对于镜像填充模式：先做其他增强，再镜像填充
+                    image = self.transform(image)
+                else:
+                    image = self.transform(image)
+        else:
+            # 没有 transform 也做镜像填充
+            if self.use_mirror_pad:
+                from utils.image_utils import mirror_pad_resize
+                img_array = np.array(image)
+                padded, pad_info = mirror_pad_resize(img_array, self.image_size, return_pad_info=True)
+                image = Image.fromarray(padded)
 
         # 图像级标签
         image_label = torch.tensor(sample["image_label"], dtype=torch.long)
@@ -68,18 +83,45 @@ class PCBWeakDataset(Dataset):
         if pixel_mask is not None:
             result["pixel_mask"] = pixel_mask
 
+        if pad_info is not None:
+            result["pad_info"] = pad_info
+
         return result
 
-    def transform_mask(self, mask):
+    def transform_mask(self, mask, return_pad_info=False):
         """
-        对掩码应用简单的变换（调整大小+转tensor）
+        对掩码应用变换（调整大小+转tensor）
+
+        Args:
+            mask: PIL Image 掩码
+            return_pad_info: 是否返回填充信息
+
+        Returns:
+            如果 return_pad_info=False: tensor
+            如果 return_pad_info=True: (tensor, pad_info)
         """
         from torchvision import transforms
-        mask_transform = transforms.Compose([
-            transforms.Resize(self.image_size, interpolation=transforms.InterpolationMode.NEAREST),
-            transforms.ToTensor(),
-        ])
-        return mask_transform(mask)
+
+        if self.use_mirror_pad:
+            from utils.image_utils import MirrorPadResize
+            mirror_pad = MirrorPadResize(size=self.image_size, is_mask=True)
+            mask_transform = transforms.Compose([
+                mirror_pad,
+                transforms.ToTensor(),
+            ])
+            result = mask_transform(mask)
+            if return_pad_info:
+                return result, mirror_pad.get_last_pad_info()
+            return result
+        else:
+            mask_transform = transforms.Compose([
+                transforms.Resize(self.image_size, interpolation=transforms.InterpolationMode.NEAREST),
+                transforms.ToTensor(),
+            ])
+            result = mask_transform(mask)
+            if return_pad_info:
+                return result, None
+            return result
 
 
 def build_dataloader(
@@ -88,6 +130,7 @@ def build_dataloader(
     samples=None,
     mode="train",
     augmentation=None,
+    use_mirror_pad=None,
 ):
     """
     构建数据加载器
@@ -98,6 +141,7 @@ def build_dataloader(
         samples: 样本列表（与 split_file 二选一）
         mode: "train", "val", 或 "test"
         augmentation: 数据增强配置（可选，默认从 config 读取）
+        use_mirror_pad: 是否使用边缘镜像填充（默认从 config 读取）
 
     Returns:
         DataLoader: PyTorch 数据加载器
@@ -106,6 +150,10 @@ def build_dataloader(
 
     data_cfg = config.get("data", {})
     image_size = tuple(data_cfg.get("image_size", [256, 256]))
+
+    # 是否使用镜像填充
+    if use_mirror_pad is None:
+        use_mirror_pad = data_cfg.get("use_mirror_pad", True)
 
     # 加载样本
     if samples is not None:
@@ -121,11 +169,20 @@ def build_dataloader(
     if augmentation is None and mode == "train":
         augmentation = config.get("augmentation", {})
 
-    transform = build_augmentation_pipeline(
-        augmentation,
-        mode=mode,
-        image_size=image_size,
-    )
+    if use_mirror_pad:
+        from utils.image_utils import build_transform_with_padding
+        transform, mirror_pad_obj = build_transform_with_padding(
+            image_size,
+            augmentation_config=augmentation if mode == "train" else None,
+            mode=mode,
+        )
+    else:
+        transform = build_augmentation_pipeline(
+            augmentation,
+            mode=mode,
+            image_size=image_size,
+        )
+        mirror_pad_obj = None
 
     # 判断是否有像素级标签
     has_pixel_labels = any(s.get("label") for s in samples)
@@ -135,6 +192,7 @@ def build_dataloader(
         transform=transform,
         image_size=image_size,
         return_pixel_label=has_pixel_labels,
+        use_mirror_pad=use_mirror_pad,
     )
 
     # 数据加载器
@@ -153,7 +211,8 @@ def build_dataloader(
     return dataloader
 
 
-def build_inference_dataset(image_paths, config=None, image_size=(256, 256)):
+def build_inference_dataset(image_paths, config=None, image_size=(256, 256),
+                            use_mirror_pad=None):
     """
     构建推理用数据集
 
@@ -161,17 +220,34 @@ def build_inference_dataset(image_paths, config=None, image_size=(256, 256)):
         image_paths: 图片路径列表
         config: 配置字典
         image_size: 图像尺寸
+        use_mirror_pad: 是否使用边缘镜像填充
 
     Returns:
         DataLoader: 推理数据加载器
     """
     from torchvision import transforms
+    from utils.image_utils import build_transform_with_padding
 
-    transform = transforms.Compose([
-        transforms.Resize(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    # 是否使用镜像填充
+    if use_mirror_pad is None:
+        if config is not None:
+            use_mirror_pad = config.get("data", {}).get("use_mirror_pad", True)
+        else:
+            use_mirror_pad = True
+
+    if use_mirror_pad:
+        transform, mirror_pad_obj = build_transform_with_padding(
+            image_size,
+            augmentation_config=None,
+            mode="test",
+        )
+    else:
+        transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        mirror_pad_obj = None
 
     samples = [
         {"image": str(p), "image_label": 0, "label": None}
@@ -183,6 +259,7 @@ def build_inference_dataset(image_paths, config=None, image_size=(256, 256)):
         transform=transform,
         image_size=image_size,
         return_pixel_label=False,
+        use_mirror_pad=use_mirror_pad,
     )
 
     batch_size = 4
