@@ -1,0 +1,98 @@
+
+# ==========================================
+# PCB 弱监督分割训练超参数配置
+# ==========================================
+
+# 数据配置
+data:
+  image_dir: "datasets/images"
+  label_dir: "datasets/labels"
+  image_size: [256, 256]
+  num_classes: 1
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  num_workers: 4
+  pin_memory: true
+
+# 模型配置
+model:
+  name: "unet"
+  in_channels: 3
+  out_channels: 1
+  base_channels: 64
+  bilinear: true
+  dropout_rate: 0.3
+
+# 训练配置
+train:
+  batch_size: 8
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  lr_scheduler: "cosine"
+  warmup_epochs: 5
+  seed: 42
+  gradient_clip: 1.0
+
+# 弱监督损失配置
+loss:
+  name: "weak_ce"
+  image_loss_weight: 1.0
+  mask_loss_weight: 0.5
+  consistency_weight: 0.1
+  threshold: 0.5
+  min_region_size: 10
+
+# 数据增强配置
+augmentation:
+  enable: true
+  noise:
+    gaussian_prob: 0.5
+    gaussian_std: [0.01, 0.05]
+    salt_pepper_prob: 0.3
+    salt_pepper_amount: 0.02
+    speckle_prob: 0.2
+    speckle_std: 0.05
+    poisson_prob: 0.2
+  geometric:
+    horizontal_flip_prob: 0.5
+    vertical_flip_prob: 0.5
+    rotate_prob: 0.3
+    rotate_degrees: [-15, 15]
+    zoom_prob: 0.2
+    zoom_range: [0.9, 1.1]
+  photometric:
+    brightness_prob: 0.3
+    brightness_range: [0.8, 1.2]
+    contrast_prob: 0.3
+    contrast_range: [0.8, 1.2]
+    blur_prob: 0.2
+    blur_kernel: [3, 5]
+
+# 推理配置
+inference:
+  batch_size: 4
+  threshold: 0.5
+  min_defect_area: 50
+  output_dir: "outputs/inference"
+  save_mask: true
+  save_overlay: true
+
+# 评估配置
+evaluation:
+  metrics: ["iou", "dice", "precision", "recall", "f1"]
+  output_dir: "outputs/evaluation"
+
+# 路径配置
+paths:
+  checkpoint_dir: "checkpoints"
+  log_dir: "outputs/logs"
+  result_dir: "outputs/results"
+
+# 设备配置
+device:
+  auto_detect: true
+  use_gpu: true
+  gpu_id: 0
+
